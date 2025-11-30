@@ -19,6 +19,8 @@ import random
 import os
 import gymnasium as gym
 import time
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
 
 class DQNNet(nn.Module):
     def __init__(self, state_size, action_size):
@@ -86,10 +88,14 @@ class PrioritizedBuffer:
             self.max_priority = max(self.max_priority, priority)
     
 class Agent:
-    def __init__(self, state_size, action_size):
+    def __init__(self, state_size, action_size, log_dir=None):
         self.state_size = state_size
         self.action_size = action_size
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        if log_dir is None:
+           log_dir = f"runs/lunar_lander_{datetime.now().strftime('%Y%m%d_%H:%M')}"
+        self.writer = SummaryWriter(log_dir=log_dir)
         
         self.q_net = DQNNet(state_size, action_size).to(self.device)
 
@@ -165,6 +171,7 @@ class Agent:
         self.optimizer.step()
         self.scheduler.step()
         self.memory.update_priorities(indices, td_errors)
+
         self.soft_update_target_net()
 
         self.losses.append(loss.item())
@@ -218,6 +225,67 @@ class Agent:
         print(f"加载模型状态失败: {e}")
         return False
     
+    def log_network_parameters(self, episode):
+        """记录神经网络参数到TensorBoard"""
+        with torch.no_grad():  # 不计算梯度，只记录参数
+        # 遍历网络的所有参数
+            for name, param in self.q_net.named_parameters():
+                if param.requires_grad:  # 只记录需要梯度的参数
+                    if 'weight' in name:
+                    # 记录权重直方图
+                        self.writer.add_histogram(f'Parameters/Weights/{name}', param, episode)
+                    # 记录权重统计量
+                        self.writer.add_scalar(f'Parameters/Weights/{name}_mean', param.mean(), episode)
+                        self.writer.add_scalar(f'Parameters/Weights/{name}_std', param.std(), episode)
+                        self.writer.add_scalar(f'Parameters/Weights/{name}_max', param.max(), episode)
+                        self.writer.add_scalar(f'Parameters/Weights/{name}_min', param.min(), episode)
+                    
+                    elif 'bias' in name:
+                    # 记录偏置直方图
+                        self.writer.add_histogram(f'Parameters/Biases/{name}', param, episode)
+                    # 记录偏置统计量
+                        self.writer.add_scalar(f'Parameters/Biases/{name}_mean', param.mean(), episode)
+                        self.writer.add_scalar(f'Parameters/Biases/{name}_std', param.std(), episode)
+
+    def log_gradients(self, episode):
+        """记录梯度信息"""
+        for name, param in self.q_net.named_parameters():
+            if param.grad is not None:  # 只有在训练后才有梯度
+                if 'weight' in name:
+                    self.writer.add_histogram(f'Gradients/Weights/{name}', param.grad, episode)
+                    self.writer.add_scalar(f'Gradients/Weights/{name}_mean', param.grad.mean(), episode)
+                elif 'bias' in name:
+                    self.writer.add_histogram(f'Gradients/Biases/{name}', param.grad, episode)
+                    self.writer.add_scalar(f'Gradients/Biases/{name}_mean', param.grad.mean(), episode)
+
+    def TensorBoard_Analysis(self, episode, total_reward, steps, loss, avg_q_value):
+        self.log_gradients(episode)
+        self.log_network_parameters(episode)
+        self.writer.add_scalar('Training/Episode Reward', total_reward, episode)
+        self.writer.add_scalar('Training/Episode Length', steps, episode)
+        self.writer.add_scalar('Training/Epsilon', self.epsilon, episode)
+
+        if loss is not None:
+            self.writer.add_scalar('Training/Loss', loss, episode)
+            self.writer.add_scalar('Training/Average Q Value', avg_q_value, episode)
+            self.writer.add_scalar('Training/Learning Rate', 
+                                 self.scheduler.get_last_lr()[0], episode)
+        
+        if episode % 10 == 0 and len(self.losses) > 0:
+            self.writer.add_scalar('Metrics/Average Loss', np.mean(self.losses), episode)
+            self.writer.add_scalar('Metrics/Average Q Value', np.mean(self.q_values), episode)
+            self.writer.add_scalar('Metrics/Average TD Error', np.mean(self.td_errors), episode)
+            self.writer.add_scalar('Metrics/Average Grad Norm', np.mean(self.grad_norms), episode)
+            self.writer.add_scalar('Metrics/Buffer Size', len(self.memory), episode)
+
+        if len(self.episode_rewards) >= 100:
+            moving_avg = np.mean(self.episode_rewards[-100:])
+            self.writer.add_scalar('Training/Moving Average (100 episodes)', moving_avg, episode)
+
+    def close(self):
+        self.writer.close()
+ 
+    
 
 def train_Agent():
     #build env
@@ -265,6 +333,7 @@ def train_Agent():
         avg_loss = np.mean(episode_losses) if episode_losses else 0
         avg_q_value = np.mean(episode_q_values) if episode_q_values else 0
 
+        agent.TensorBoard_Analysis(episode, total_reward, steps, avg_loss, avg_q_value)#tensorboard
         if episode % 10 == 0:
             moving_avg = np.mean(agent.episode_rewards[-100:]) if len(agent.episode_rewards) >= 100 else np.mean(agent.episode_rewards)
             elapsed_time = time.time() - start_time
@@ -288,7 +357,7 @@ def train_Agent():
                 consecutive_success = 0
     total_time = time.time() - start_time
     print(f'\n训练总时间: {total_time:.1f} 秒')
-    
+    agent.close()
     env.close()
     validation_env.close()
     
