@@ -38,9 +38,9 @@ class DQNNet(nn.Module):
             nn.init.constant_(module.bias, 0.1)
 
     def forward(self, state_size):
-        x = F.relu(self.linear1(state_size))
-        x = F.relu(self.linear2(x))
-        x = F.relu(self.linear3(x))
+        x = F.leaky_relu(self.linear1(state_size))
+        x = F.leaky_relu(self.linear2(x))
+        x = F.leaky_relu(self.linear3(x))
         x = self.linear4(x)
         return x
 
@@ -295,8 +295,8 @@ def train_Agent():
     action_size = env.action_space.n
 
     agent = Agent(state_size, action_size)
-    max_episodes = 1500
-    target_score = 200
+    max_episodes = 2000
+    target_score = 230
     consecutive_success = 0
     required_consecutive = 10
 
