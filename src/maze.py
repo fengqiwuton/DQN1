@@ -48,32 +48,21 @@ class mazeEnv(gym.Env):
             'human': (70,130,180)
         }
 
-    def create_maze(self, obstacle_density = 0.3):
+    def create_maze(self):
         # 0:obstacle
-        maze = [[1 for i in range(self.col)] for j in range(self.row)]
-        for x in range(self.col):
-           maze[0][x] = 0
-           maze[self.row-1][x] = 0
-        for y in range(self.row):
-           maze[y][0] = 0
-           maze[y][self.col-1] = 0
-        for y in range(1, self.col-1):
-            for x in range(1, self.row-1):
-                if random.random() < obstacle_density:
-                    maze[y][x] = 0
-        maze[self.startpos[0]][self.startpos[1]] = 1
-        maze[self.goalpos[0]][self.goalpos[1]] = 1
-        for y in range(1, self.col-1):
-            for x in range(1, self.row-1):
-                if maze[x][y] == 0:
-                    neighbors = [(x-1, y), (x+1, y), (x, y-1), (x, y+1)]
-                    path_count = sum(1 for nx, ny in neighbors if maze[nx][ny] == 1)
-                    if path_count == 0:
-                        dx, dy = random.choice([(1, 0), (-1, 0), (0, 1), (0, -1)])
-                        nx, ny = x + dx, y + dy
-                        if 0 <= nx < self.row and 0 <= ny < self.col:
-                            maze[nx][ny] = 1        
+        maze = [[0 for i in range(self.col)] for j in range(self.row)]
+        directions = [(0, 2), (2, 0), (0, -2), (-2, 0)]
+        def dfs(x, y):
+            maze[y][x] = 1 # 标记为路径
+            random.shuffle(directions) # 随机选择方向
+            for dx, dy in directions:
+                nx, ny = x + dx, y + dy
+                if 0 < nx < self.col - 1 and 0 < ny < self.row - 1 and maze[ny][nx] == 0:
+                    maze[y + dy // 2][x + dx // 2] = 1 # 打通墙壁
+                    dfs(nx, ny)
+        dfs(1, 1)        
         self.maze = maze
+        
 
     def reset(self, *, seed = None, options = None):
         super().reset(seed=seed)
@@ -189,7 +178,7 @@ class mazeEnv(gym.Env):
         env.close()
 
 if __name__ == "__main__":
-    env = mazeEnv(mazesize=(8,7),
+    env = mazeEnv(mazesize=(27,27),
             render_mode='human')
     env.test_env()
 
