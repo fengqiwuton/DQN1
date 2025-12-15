@@ -379,15 +379,19 @@ class ReplayMemory:
         self.log_prob_cap.clear()
 
 class PPOAgent:
-    def __init__(self, state_dim, action_dim, batch_size=64):
+    def __init__(self, state_dim, action_dim, batch_size=64,writer = None):
         self.lr_actor = 3e-4
         self.lr_critic = 3e-4
         self.gamma = 0.99
         self.lamb = 0.95  # GAE lambda
         self.epoch = 10   # 优化epoch数
-        self.clip_range = 0.2  # PPO clip范围
+        self.clip_range = 0.15  # PPO clip范围
         self.batch_size = batch_size
-        self.entropy_coef = 0.01
+        self.entropy_coef = 0.02
+
+        # TensorBoard Writer
+        self.writer = writer
+        self.update_step = 0  # 用于记录更新次数
 
         # 网络
         self.actor = Actor(state_dim, action_dim).to(device)
@@ -458,15 +462,16 @@ class PPOAgent:
             'log_probs': log_probs,
             'entropy': entropy,
             'values': values,
-            'dist': dist
+            'dist': dist,
+            'action_probs': action_probs
         }
 
     def normalize_advantages(self, advantages):
         """归一化优势函数"""
         return (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-    def update(self):
-        """执行PPO更新"""
+    def update(self, episode):
+        """执行PPO更新，添加TensorBoard记录"""
         # 1. 收集所有数据
         data = self.replay_buffer.get_all_data()
         n_samples = len(data['states'])
@@ -498,15 +503,21 @@ class PPOAgent:
         # 归一化优势函数
         advantages_tensor = self.normalize_advantages(advantages_tensor)
         
-        # 3. 多轮优化（类似参考代码的for k in range(n_optimization_epochs)）
-        policy_train_stats = defaultdict(list)
-        critic_train_stats = defaultdict(list)
+        # 收集统计信息
+        epoch_policy_losses = []
+        epoch_critic_losses = []
+        epoch_entropies = []
+        epoch_advantages = []
+        epoch_returns = []
+        epoch_ratios = []
+        epoch_kl_divs = []
         
+        # 3. 多轮优化
         for epoch in range(self.epoch):
             # 随机打乱数据
             indices = np.random.permutation(n_samples)
             
-            # 分批处理（类似参考代码的mini-batch updates）
+            # 分批处理
             n_batches = int(np.ceil(float(n_samples) / self.batch_size))
             
             for batch_idx in range(n_batches):
@@ -522,7 +533,7 @@ class PPOAgent:
                 batch_advantages = advantages_tensor[batch_indices]
                 batch_returns = returns_tensor[batch_indices]
                 
-                # 4. 计算新策略的输出（类似参考代码的policy_output, critic_output）
+                # 4. 计算新策略的输出
                 actor_critic_output = self.compute_actor_critic_output(
                     batch_states, 
                     batch_actions
@@ -531,6 +542,16 @@ class PPOAgent:
                 new_log_probs = actor_critic_output['log_probs']
                 entropy = actor_critic_output['entropy'].mean()
                 values_pred = actor_critic_output['values'].squeeze()
+                action_probs = actor_critic_output['action_probs']
+                
+                with torch.no_grad():
+                    # 方法1：使用log_ratio计算KL散度（最简单）
+                    log_ratio = new_log_probs - batch_old_log_probs
+                    ratio = torch.exp(log_ratio)
+                    
+                    # KL散度近似：KL ≈ (ratio - 1) - log_ratio
+                    kl_div_tensor = ((ratio - 1) - log_ratio).mean()
+                    kl_div = kl_div_tensor.item()  # 转换为float
                 
                 # 5. 计算策略损失
                 # 计算概率比
@@ -567,24 +588,83 @@ class PPOAgent:
                 torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
                 self.critic_optim.step()
                 
-                # 记录训练统计
-                policy_train_stats['policy_loss'].append(policy_loss.item())
-                policy_train_stats['entropy'].append(entropy.item())
-                critic_train_stats['value_loss'].append(critic_loss.item())
+                # 收集统计信息
+                epoch_policy_losses.append(policy_loss.item())
+                epoch_critic_losses.append(critic_loss.item())
+                epoch_entropies.append(entropy.item())
+                epoch_advantages.append(batch_advantages.mean().item())
+                epoch_returns.append(batch_returns.mean().item())
+                epoch_ratios.append(ratio.mean().item())
+                epoch_kl_divs.append(kl_div)
         
         # 8. 清空缓冲区
         self.replay_buffer.clear_memo()
         
-        # 9. 记录训练统计
-        if len(policy_train_stats['policy_loss']) > 0:
-            avg_policy_loss = np.mean(policy_train_stats['policy_loss'])
-            avg_entropy = np.mean(policy_train_stats['entropy'])
-            avg_value_loss = np.mean(critic_train_stats['value_loss'])
+        # 9. 记录训练统计和TensorBoard
+        if len(epoch_policy_losses) > 0:
+            avg_policy_loss = np.mean(epoch_policy_losses)
+            avg_critic_loss = np.mean(epoch_critic_losses)
+            avg_entropy = np.mean(epoch_entropies)
+            avg_advantage = np.mean(epoch_advantages)
+            avg_return = np.mean(epoch_returns)
+            avg_ratio = np.mean(epoch_ratios)
+            avg_kl_div = np.mean(epoch_kl_divs)
             
+            # 输出到控制台
             print(f"PPO Update Stats: "
                   f"Policy Loss: {avg_policy_loss:.4f}, "
-                  f"Value Loss: {avg_value_loss:.4f}, "
-                  f"Entropy: {avg_entropy:.4f}")
+                  f"Value Loss: {avg_critic_loss:.4f}, "
+                  f"Entropy: {avg_entropy:.4f}, "
+                  f"KL Div: {avg_kl_div:.4f}")
+            
+            # 记录到TensorBoard
+            if self.writer is not None:
+                self.writer.add_scalar('Loss/Policy_Loss', avg_policy_loss, episode)
+                self.writer.add_scalar('Loss/Value_Loss', avg_critic_loss, episode)
+                self.writer.add_scalar('Loss/Total_Loss', avg_policy_loss + avg_critic_loss, episode)
+                self.writer.add_scalar('Policy/Entropy', avg_entropy, episode)
+                self.writer.add_scalar('Policy/KL_Divergence', avg_kl_div, episode)
+                self.writer.add_scalar('Policy/Probability_Ratio', avg_ratio, episode)
+                self.writer.add_scalar('Policy/Clip_Fraction', 
+                                      np.mean([1.0 if r < 1.0 - self.clip_range or r > 1.0 + self.clip_range else 0.0 
+                                              for r in epoch_ratios]), episode)
+                self.writer.add_scalar('Value/Advantage', avg_advantage, episode)
+                self.writer.add_scalar('Value/Return', avg_return, episode)
+                self.writer.add_scalar('Value/Returns_Std', np.std(epoch_returns), episode)
+                
+                # 记录网络梯度
+                total_actor_grad_norm = 0
+                total_critic_grad_norm = 0
+                for param in self.actor.parameters():
+                    if param.grad is not None:
+                        total_actor_grad_norm += param.grad.norm().item()
+                for param in self.critic.parameters():
+                    if param.grad is not None:
+                        total_critic_grad_norm += param.grad.norm().item()
+                
+                self.writer.add_scalar('Gradients/Actor_Grad_Norm', total_actor_grad_norm, episode)
+                self.writer.add_scalar('Gradients/Critic_Grad_Norm', total_critic_grad_norm, episode)
+                
+                # 记录网络参数
+                for name, param in self.actor.named_parameters():
+                    self.writer.add_histogram(f'Actor/{name}', param, episode)
+                    if param.grad is not None:
+                        self.writer.add_histogram(f'Actor/{name}_grad', param.grad, episode)
+                
+                for name, param in self.critic.named_parameters():
+                    self.writer.add_histogram(f'Critic/{name}', param, episode)
+                    if param.grad is not None:
+                        self.writer.add_histogram(f'Critic/{name}_grad', param.grad, episode)
+                
+                self.update_step += 1
+        
+        return {
+            'policy_loss': avg_policy_loss,
+            'critic_loss': avg_critic_loss,
+            'entropy': avg_entropy,
+            'kl_divergence': avg_kl_div
+        }
+    
     
     def save_policy(self, path="ppo_model_final.pth"):
         """保存模型"""
@@ -607,23 +687,27 @@ class PPOAgent:
 
 # 训练函数保持不变，但修改update_interval
 def train_maze(env, episodes=2000, max_steps=100, batch_size=128, update_interval=20):
-    """训练PPO智能体解决迷宫"""
+    """训练PPO智能体解决迷宫，添加TensorBoard监控"""
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
     
     print(f"状态维度: {state_dim}")
     print(f"动作维度: {action_dim}")
     
-    agent = PPOAgent(state_dim, action_dim, batch_size)
+    # 创建TensorBoard Writer
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    writer = SummaryWriter(f'runs/maze_ppo_{timestamp}')
+    
+    # 将writer传递给PPOAgent
+    agent = PPOAgent(state_dim, action_dim, batch_size, writer=writer)
     
     episode_rewards = []
     successes = []
-    best_reward = -float('inf')
+    episode_lengths = []
+    
     
     print("\n开始训练...")
     print("=" * 50)
-    
-    start_time = time.time()
     
     for episode in range(1, episodes + 1):
         state, info = env.reset()
@@ -645,28 +729,46 @@ def train_maze(env, episodes=2000, max_steps=100, batch_size=128, update_interva
             episode_length += 1
         
         episode_rewards.append(episode_reward)
+        episode_lengths.append(episode_length)
         successes.append(1 if terminated else 0)
+        
+        # 记录每个episode的统计信息到TensorBoard
+        if writer is not None:
+            writer.add_scalar('Episode/Reward', episode_reward, episode)
+            writer.add_scalar('Episode/Length', episode_length, episode)
+            writer.add_scalar('Episode/Success', 1 if terminated else 0, episode)
+            writer.add_scalar('Episode/Distance_To_Goal', 
+                             info.get('distance_to_goal', 0) if 'distance_to_goal' in info else 0, 
+                             episode)
         
         # 定期更新（收集足够数据后）
         if episode % update_interval == 0 and len(agent.replay_buffer.state_cap) >= batch_size:
-            agent.update()
+            update_stats = agent.update(episode)
         
         if episode % 50 == 0:
             avg_reward = np.mean(episode_rewards[-50:]) if len(episode_rewards) >= 50 else episode_reward
             success_rate = np.mean(successes[-50:]) * 100 if len(successes) >= 50 else 0
+            avg_length = np.mean(episode_lengths[-50:]) if len(episode_lengths) >= 50 else episode_length
+            
+            # 记录滑动平均统计到TensorBoard
+            if writer is not None:
+                writer.add_scalar('Episode/Avg_Reward_50', avg_reward, episode)
+                writer.add_scalar('Episode/Avg_Length_50', avg_length, episode)
+                writer.add_scalar('Episode/Success_Rate_50', success_rate, episode)
             
             print(f"Episode {episode:4d} | "
                   f"Reward: {episode_reward:7.2f} | "
                   f"Avg Reward (50): {avg_reward:7.2f} | "
+                  f"Length: {episode_length:3d} | "
+                  f"Avg Length (50): {avg_length:5.1f} | "
                   f"Success: {('Yes' if terminated else 'No'):3s} | "
                   f"Success Rate: {success_rate:5.1f}%")
     
-    training_time = time.time() - start_time
+        # 关闭writer
+        writer.close()
     
     print("\n" + "=" * 50)
     print(f"训练完成!")
-    print(f"总训练时间: {training_time:.2f} 秒")
-    print(f"最佳奖励: {best_reward:.2f}")
     print(f"最终成功率: {np.mean(successes[-50:])*100:.1f}%" if len(successes) >= 50 else "训练数据不足")
     
     # 保存最终模型
@@ -734,9 +836,9 @@ if __name__ == "__main__":
     
     # 参数设置
     MAZE_SIZE = (11, 11)
-    VIEW_RANGE = 3
-    EPISODES = 1500
-    BATCH_SIZE = 64
+    VIEW_RANGE = 11
+    EPISODES = 1000
+    BATCH_SIZE = 256
     MAX_STEPS = 200
     
     # 创建训练环境
