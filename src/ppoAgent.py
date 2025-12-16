@@ -1,4 +1,4 @@
-import gymnasium as gym
+'''import gymnasium as gym
 import numpy as np
 from collections import defaultdict
 from gymnasium import spaces
@@ -144,7 +144,14 @@ class mazeEnv(gym.Env):
             random.seed(seed)
         
         # 重新生成迷宫（可选）
-        self.create_maze()
+        #self.create_maze()
+        self.position_visit_count = {}
+        self.last_positions = []
+
+        # 记录起点
+        start_pos = tuple(self.startpos)
+        self.position_visit_count[start_pos] = 1
+        self.last_positions.append(start_pos)
         
         self.human = list(self.startpos)
         self.step_count = 0
@@ -164,7 +171,7 @@ class mazeEnv(gym.Env):
     def step(self, action:int):
         self.step_count += 1
         old_pos = self.human.copy()
-    
+
         # 执行动作
         if action == 0:  # 上
             self.human[0] = max(0, self.human[0] - 1)
@@ -174,56 +181,97 @@ class mazeEnv(gym.Env):
             self.human[1] = max(0, self.human[1] - 1)
         elif action == 3:  # 右
             self.human[1] = min(self.col - 1, self.human[1] + 1)
-    
+
         # 检查是否撞墙
         hit_wall = False
         if self.maze[self.human[0]][self.human[1]] == 0:
             self.human = old_pos  # 退回原位
             hit_wall = True
-    
+
         # 计算奖励
         reward = 0
         terminated = False
         truncated = False
-    
+
         # 到达目标
         if (self.human[0] == self.goalpos[0] and self.human[1] == self.goalpos[1]):
-            reward = 100.0  # 大幅增加成功奖励
+            reward = 100.0
             terminated = True
+            # 在返回前记录奖励组成信息
+            info = {
+                'position': tuple(self.human),
+                'goal': self.goalpos,
+                'old_position': tuple(old_pos),
+                'hit_wall': hit_wall,
+                'distance_to_goal': 0,
+                'reason': 'reached_goal'
+            }
+            return self.get_observation(), reward, terminated, truncated, info
+        
+        # ### 智能奖励设计：既要防止刷分，又要鼓励探索 ###
+        
+        # 1. 基础距离奖励
+        old_distance = np.linalg.norm(np.array(old_pos) - np.array(self.goalpos))
+        new_distance = np.linalg.norm(np.array(self.human) - np.array(self.goalpos))
+        distance_improvement =  new_distance/old_distance
+        
+        # 靠近目标给予奖励，远离不惩罚
+        if distance_improvement > 0 and distance_improvement < 1:  # 需要显著改善
+            distance_reward = (1-distance_improvement) * 8.0  # 合理权重
         else:
-            # 距离奖励：鼓励靠近目标
-            old_distance = np.linalg.norm(np.array(old_pos) - np.array(self.goalpos))
-            new_distance = np.linalg.norm(np.array(self.human) - np.array(self.goalpos))
-            distance_reward = (old_distance - new_distance) * 5.0  # 增加权重
+            distance_reward = 0
         
-            # 步数惩罚（减少）
-            step_penalty = -0.01  # 减少步数惩罚
+        # 2. 步数惩罚（轻微）
+        step_penalty = -0.01
         
-            # 撞墙惩罚
-            wall_penalty = -0.5 if hit_wall else 0.0  # 减少撞墙惩罚
+        # 3. 撞墙惩罚（适中）
+        wall_penalty = -0.8 if hit_wall else 0.0
         
-            reward = distance_reward + step_penalty + wall_penalty
-    
-        # 检查是否超时
+        # 4. 重复访问惩罚（防止刷分，但要适度）
+        current_pos = tuple(self.human)
+        
+        # 确保访问计数器存在
+        if not hasattr(self, 'position_visit_count'):
+            self.position_visit_count = {}
+        
+        visit_count = self.position_visit_count.get(current_pos, 0) + 1
+        self.position_visit_count[current_pos] = visit_count
+        
+        # 重复访问惩罚（适度）
+        repeat_penalty = 0
+        if visit_count > 2:  # 第三次及以后访问才惩罚
+            repeat_penalty = -0.5 * (visit_count - 2)  # 轻微惩罚
+        
+        # 5. 探索奖励（鼓励访问新区域）
+        explore_reward = 2 if visit_count == 1 else 0.0
+        
+        # 6. 限制负奖励幅度
+        repeat_penalty = max(repeat_penalty, -8)
+        
+        # 7. 组合奖励
+        reward = distance_reward + step_penalty + wall_penalty + repeat_penalty + explore_reward
+        
+        # 8. 检查是否超时
         truncated = self.step_count >= self.max_steps
-    
-        # 获取新状态
+
         observation = self.get_observation()
-    
+
         info = {
             'position': tuple(self.human),
             'goal': self.goalpos,
             'old_position': tuple(old_pos),
             'hit_wall': hit_wall,
-            'distance_to_goal': np.linalg.norm(np.array(self.human) - np.array(self.goalpos)),
-            'local_maze': self.get_local_maze_with_position(),
+            'distance_to_goal': new_distance,
+            'distance_improvement': distance_improvement,
+            'total_reward': reward,
             'step': self.step_count
         }
-    
+        
         if self.render_mode == 'human':
             self.render()
-        
+            
         return observation, reward, terminated, truncated, info
+
     
     def render(self):
         try:
@@ -383,9 +431,9 @@ class PPOAgent:
         self.lr_actor = 3e-4
         self.lr_critic = 3e-4
         self.gamma = 0.99
-        self.lamb = 0.95  # GAE lambda
+        self.lamb = 0.9  # GAE lambda
         self.epoch = 10   # 优化epoch数
-        self.clip_range = 0.15  # PPO clip范围
+        self.clip_range = 0.1  # PPO clip范围
         self.batch_size = batch_size
         self.entropy_coef = 0.02
 
@@ -471,7 +519,6 @@ class PPOAgent:
         return (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     def update(self, episode):
-        """执行PPO更新，添加TensorBoard记录"""
         # 1. 收集所有数据
         data = self.replay_buffer.get_all_data()
         n_samples = len(data['states'])
@@ -479,13 +526,11 @@ class PPOAgent:
         if n_samples < self.batch_size:
             return
         
-        # 2. 计算旧策略的log prob和回报
+        # 2. 计算GAE和回报
         with torch.no_grad():
-            # 计算旧的价值
             states_tensor = torch.FloatTensor(data['states']).to(device)
             old_values = self.critic(states_tensor).squeeze().cpu().numpy()
             
-            # 计算GAE和回报
             advantages, returns = self.compute_gae(
                 data['rewards'], 
                 old_values, 
@@ -507,26 +552,19 @@ class PPOAgent:
         epoch_policy_losses = []
         epoch_critic_losses = []
         epoch_entropies = []
-        epoch_advantages = []
-        epoch_returns = []
-        epoch_ratios = []
-        epoch_kl_divs = []
-        
+        epoch_ratios = []  # 只记录ratio，不记录KL
+        all_ratios = []  # 新增：收集所有ratio
+
         # 3. 多轮优化
         for epoch in range(self.epoch):
-            # 随机打乱数据
             indices = np.random.permutation(n_samples)
-            
-            # 分批处理
             n_batches = int(np.ceil(float(n_samples) / self.batch_size))
             
             for batch_idx in range(n_batches):
-                # 获取批次索引
                 start_idx = batch_idx * self.batch_size
                 end_idx = start_idx + self.batch_size
                 batch_indices = indices[start_idx:end_idx]
                 
-                # 获取批次数据
                 batch_states = states_tensor[batch_indices]
                 batch_actions = actions_tensor[batch_indices]
                 batch_old_log_probs = old_log_probs[batch_indices]
@@ -542,26 +580,20 @@ class PPOAgent:
                 new_log_probs = actor_critic_output['log_probs']
                 entropy = actor_critic_output['entropy'].mean()
                 values_pred = actor_critic_output['values'].squeeze()
-                action_probs = actor_critic_output['action_probs']
                 
-                with torch.no_grad():
-                    # 方法1：使用log_ratio计算KL散度（最简单）
-                    log_ratio = new_log_probs - batch_old_log_probs
-                    ratio = torch.exp(log_ratio)
-                    
-                    # KL散度近似：KL ≈ (ratio - 1) - log_ratio
-                    kl_div_tensor = ((ratio - 1) - log_ratio).mean()
-                    kl_div = kl_div_tensor.item()  # 转换为float
-                
-                # 5. 计算策略损失
-                # 计算概率比
+                # 5. 计算概率比
                 ratio = torch.exp(new_log_probs - batch_old_log_probs)
+                # 收集所有ratio值
+                all_ratios.append(ratio.detach())  # 新增
                 
-                # PPO裁剪目标函数
+                # ### 核心：PPO-Clip损失计算 ###
+                # 计算裁剪前后的目标
                 surr1 = ratio * batch_advantages
                 surr2 = torch.clamp(ratio, 
                                     1.0 - self.clip_range, 
                                     1.0 + self.clip_range) * batch_advantages
+                
+                # PPO-Clip策略损失
                 policy_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy
                 
                 # 6. 计算价值损失
@@ -592,79 +624,52 @@ class PPOAgent:
                 epoch_policy_losses.append(policy_loss.item())
                 epoch_critic_losses.append(critic_loss.item())
                 epoch_entropies.append(entropy.item())
-                epoch_advantages.append(batch_advantages.mean().item())
-                epoch_returns.append(batch_returns.mean().item())
                 epoch_ratios.append(ratio.mean().item())
-                epoch_kl_divs.append(kl_div)
         
         # 8. 清空缓冲区
         self.replay_buffer.clear_memo()
         
-        # 9. 记录训练统计和TensorBoard
+        # 9. 记录训练统计
         if len(epoch_policy_losses) > 0:
             avg_policy_loss = np.mean(epoch_policy_losses)
             avg_critic_loss = np.mean(epoch_critic_losses)
             avg_entropy = np.mean(epoch_entropies)
-            avg_advantage = np.mean(epoch_advantages)
-            avg_return = np.mean(epoch_returns)
             avg_ratio = np.mean(epoch_ratios)
-            avg_kl_div = np.mean(epoch_kl_divs)
+            # 计算clip_fraction（新增几行代码）
+            if len(all_ratios) > 0:
+                # 合并所有ratio
+                all_ratios_tensor = torch.cat(all_ratios)
+            # 计算clip_fraction（重要指标）
+            # 精确的clip_fraction（新增）
+            clipped = torch.clamp(all_ratios_tensor, 
+                                1.0 - self.clip_range, 
+                                1.0 + self.clip_range)
+            clip_fraction = torch.mean(
+                torch.abs(all_ratios_tensor - clipped) / (torch.abs(all_ratios_tensor) + 1e-8)
+            ).item()
             
-            # 输出到控制台
-            print(f"PPO Update Stats: "
-                  f"Policy Loss: {avg_policy_loss:.4f}, "
-                  f"Value Loss: {avg_critic_loss:.4f}, "
-                  f"Entropy: {avg_entropy:.4f}, "
-                  f"KL Div: {avg_kl_div:.4f}")
+            print(f"PPO-Clip Update Stats: "
+                f"Policy Loss: {avg_policy_loss:.4f}, "
+                f"Value Loss: {avg_critic_loss:.4f}, "
+                f"Entropy: {avg_entropy:.4f}, "
+                f"Clip Fraction: {clip_fraction:.3f}")
             
-            # 记录到TensorBoard
+            # TensorBoard记录
             if self.writer is not None:
                 self.writer.add_scalar('Loss/Policy_Loss', avg_policy_loss, episode)
                 self.writer.add_scalar('Loss/Value_Loss', avg_critic_loss, episode)
-                self.writer.add_scalar('Loss/Total_Loss', avg_policy_loss + avg_critic_loss, episode)
                 self.writer.add_scalar('Policy/Entropy', avg_entropy, episode)
-                self.writer.add_scalar('Policy/KL_Divergence', avg_kl_div, episode)
+                self.writer.add_scalar('Policy/Clip_Fraction', clip_fraction, episode)
                 self.writer.add_scalar('Policy/Probability_Ratio', avg_ratio, episode)
-                self.writer.add_scalar('Policy/Clip_Fraction', 
-                                      np.mean([1.0 if r < 1.0 - self.clip_range or r > 1.0 + self.clip_range else 0.0 
-                                              for r in epoch_ratios]), episode)
-                self.writer.add_scalar('Value/Advantage', avg_advantage, episode)
-                self.writer.add_scalar('Value/Return', avg_return, episode)
-                self.writer.add_scalar('Value/Returns_Std', np.std(epoch_returns), episode)
-                
-                # 记录网络梯度
-                total_actor_grad_norm = 0
-                total_critic_grad_norm = 0
-                for param in self.actor.parameters():
-                    if param.grad is not None:
-                        total_actor_grad_norm += param.grad.norm().item()
-                for param in self.critic.parameters():
-                    if param.grad is not None:
-                        total_critic_grad_norm += param.grad.norm().item()
-                
-                self.writer.add_scalar('Gradients/Actor_Grad_Norm', total_actor_grad_norm, episode)
-                self.writer.add_scalar('Gradients/Critic_Grad_Norm', total_critic_grad_norm, episode)
-                
-                # 记录网络参数
-                for name, param in self.actor.named_parameters():
-                    self.writer.add_histogram(f'Actor/{name}', param, episode)
-                    if param.grad is not None:
-                        self.writer.add_histogram(f'Actor/{name}_grad', param.grad, episode)
-                
-                for name, param in self.critic.named_parameters():
-                    self.writer.add_histogram(f'Critic/{name}', param, episode)
-                    if param.grad is not None:
-                        self.writer.add_histogram(f'Critic/{name}_grad', param.grad, episode)
-                
-                self.update_step += 1
+                self.writer.add_scalar('Policy/Ratio_Std', np.std(epoch_ratios), episode)
         
         return {
             'policy_loss': avg_policy_loss,
             'critic_loss': avg_critic_loss,
             'entropy': avg_entropy,
-            'kl_divergence': avg_kl_div
+            'clip_fraction': clip_fraction
         }
-    
+        
     
     def save_policy(self, path="ppo_model_final.pth"):
         """保存模型"""
@@ -835,7 +840,7 @@ if __name__ == "__main__":
     
     
     # 参数设置
-    MAZE_SIZE = (11, 11)
+    MAZE_SIZE = (17, 17)
     VIEW_RANGE = 11
     EPISODES = 1000
     BATCH_SIZE = 256
@@ -859,6 +864,1055 @@ if __name__ == "__main__":
         batch_size=BATCH_SIZE,
         update_interval=10
     )
+    # 测试智能体
+    test_env = mazeEnv(mazesize=MAZE_SIZE, render_mode='human', view_range=VIEW_RANGE)
+    test_maze(test_env, agent, episodes=10, render=True)'''
+import gymnasium as gym
+import numpy as np
+from collections import defaultdict
+from gymnasium import spaces
+from typing import Tuple, Optional
+import random
+from gymnasium.error import DependencyNotInstalled
+import pygame
+import time
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+
+
+# develop a simple maze and train an agent to solve the problem
+VIEWPORT_W = 400
+VIEWPORT_H = 400
+
+class mazeEnv(gym.Env):
+    """
+    action space: 0:up 1:down 2:left 3:right
+    observation space: 相对坐标 + 局部迷宫拓扑
+    """
+    metadata = {'render_modes':['human', 'rgb_array'],'render_fps':4}
+    
+    def __init__(self, 
+                 mazesize:Tuple[int,int]=(7,7),
+                 render_mode:Optional[str] = None,
+                 view_range:int=5):
+        super().__init__()
+        self.mazesize = mazesize
+        self.row, self.col = mazesize
+        self.view_range = view_range  # 智能体能看到周围多远的范围
+        
+        # 动作空间：4个方向
+        self.action_space = spaces.Discrete(4)
+        
+        # 状态空间：
+        # 1. 相对坐标 (2维)
+        # 2. 局部迷宫拓扑 (view_range*2+1)^2 维
+        local_grid_size = (view_range*2 + 1) ** 2
+        self.observation_space = spaces.Box(
+            low=0,
+            high=1,
+            shape=(2 + local_grid_size,),  # 相对坐标 + 局部迷宫
+            dtype=np.float32
+        )
+        
+        self.startpos = (1, 1)
+        self.goalpos = (self.row-2, self.col-2)
+        self.human = list(self.startpos)
+        self.render_mode = render_mode
+        self.window: pygame.Surface = None
+        self.clock = None
+        self.step_count = 0
+        self.max_steps = self.row * self.col * 2
+        self.create_maze()
+        
+        # 颜色定义
+        self.color = {
+            'background': (255, 255, 255),
+            'obstacle': (100, 100, 100),
+            'path': (255, 255, 255),
+            'start': (144, 238, 144),
+            'goal': (240, 128, 128),
+            'human': (70, 130, 180)
+        }
+
+    def create_maze(self):
+        # 0:obstacle, 1:path
+        maze = [[0 for _ in range(self.col)] for _ in range(self.row)]
+        directions = [(0, 2), (2, 0), (0, -2), (-2, 0)]
+        
+        def dfs(x, y):
+            maze[y][x] = 1  # 标记为路径
+            random.shuffle(directions)  # 随机选择方向
+            for dx, dy in directions:
+                nx, ny = x + dx, y + dy
+                if 0 < nx < self.col - 1 and 0 < ny < self.row - 1 and maze[ny][nx] == 0:
+                    maze[y + dy // 2][x + dx // 2] = 1  # 打通墙壁
+                    dfs(nx, ny)
+        
+        dfs(1, 1)
+        self.maze = maze
+        
+        # 确保起点和终点是通路
+        self.maze[self.startpos[0]][self.startpos[1]] = 1
+        self.maze[self.goalpos[0]][self.goalpos[1]] = 1
+
+    def get_local_maze_with_position(self):
+        """获取带位置信息的局部迷宫（用于调试）"""
+        local_maze = []
+        for dx in range(-self.view_range, self.view_range + 1):
+            row = []
+            for dy in range(-self.view_range, self.view_range + 1):
+                nx, ny = self.human[0] + dx, self.human[1] + dy
+                
+                if 0 <= nx < self.row and 0 <= ny < self.col:
+                    if (nx, ny) == (self.human[0], self.human[1]):
+                        row.append('A')  # Agent
+                    elif (nx, ny) == self.goalpos:
+                        row.append('G')  # Goal
+                    elif self.maze[nx][ny] == 0:
+                        row.append('X')  # Wall
+                    else:
+                        row.append(' ')  # Path
+                else:
+                    row.append('B')  # Border
+            local_maze.append(row)
+        return local_maze
+    
+    def get_observation(self):
+        """获取状态观察：相对坐标 + 局部迷宫拓扑"""
+        # 1. 相对坐标：当前位置到目标位置的相对坐标（归一化）
+        rel_x = (self.goalpos[0] - self.human[0]) / self.row
+        rel_y = (self.goalpos[1] - self.human[1]) / self.col
+        
+        # 2. 局部迷宫拓扑
+        local_grid = []
+        for dx in range(-self.view_range, self.view_range + 1):
+            for dy in range(-self.view_range, self.view_range + 1):
+                nx, ny = self.human[0] + dx, self.human[1] + dy
+                
+                if 0 <= nx < self.row and 0 <= ny < self.col:
+                    # 在边界内
+                    cell_type = self.maze[nx][ny]
+                else:
+                    # 超出边界，视为障碍物
+                    cell_type = 0
+                
+                local_grid.append(cell_type)
+        
+        # 组合成状态向量
+        observation = np.array([rel_x, rel_y] + local_grid, dtype=np.float32)
+        return observation
+
+
+    def reset(self, seed=None, options=None):
+        if seed is not None:
+            np.random.seed(seed)
+            random.seed(seed)
+        
+        # 重新生成迷宫（可选）
+        self.create_maze()
+        self.position_visit_count = {}
+        self.last_positions = []
+
+        # 记录起点
+        start_pos = tuple(self.startpos)
+        self.position_visit_count[start_pos] = 1
+        self.last_positions.append(start_pos)
+        
+        self.human = list(self.startpos)
+        self.step_count = 0
+        
+        observation = self.get_observation()
+        info = {
+            'position': tuple(self.human),
+            'goal': self.goalpos,
+            'local_maze': self.get_local_maze_with_position()
+        }
+        
+        if self.render_mode == 'human':
+            self.render()
+            
+        return observation, info
+    
+    def step(self, action:int):
+        self.step_count += 1
+        old_pos = self.human.copy()
+
+        # 执行动作
+        if action == 0:  # 上
+            self.human[0] = max(0, self.human[0] - 1)
+        elif action == 1:  # 下
+            self.human[0] = min(self.row - 1, self.human[0] + 1)
+        elif action == 2:  # 左
+            self.human[1] = max(0, self.human[1] - 1)
+        elif action == 3:  # 右
+            self.human[1] = min(self.col - 1, self.human[1] + 1)
+
+        # 检查是否撞墙
+        hit_wall = False
+        if self.maze[self.human[0]][self.human[1]] == 0:
+            self.human = old_pos  # 退回原位
+            hit_wall = True
+
+        # 计算奖励
+        reward = 0
+        terminated = False
+        truncated = False
+
+        # 到达目标
+        if (self.human[0] == self.goalpos[0] and self.human[1] == self.goalpos[1]):
+            reward = 100.0
+            terminated = True
+            # 在返回前记录奖励组成信息
+            info = {
+                'position': tuple(self.human),
+                'goal': self.goalpos,
+                'old_position': tuple(old_pos),
+                'hit_wall': hit_wall,
+                'distance_to_goal': 0,
+                'reason': 'reached_goal'
+            }
+            return self.get_observation(), reward, terminated, truncated, info
+        
+        # ### 智能奖励设计：既要防止刷分，又要鼓励探索 ###
+        
+        # 1. 基础距离奖励
+        old_distance = np.linalg.norm(np.array(old_pos) - np.array(self.goalpos))
+        new_distance = np.linalg.norm(np.array(self.human) - np.array(self.goalpos))
+        distance_improvement =  new_distance/old_distance
+        
+        # 靠近目标给予奖励，远离不惩罚
+        if distance_improvement > 0 and distance_improvement < 1:  # 需要显著改善
+            distance_reward = (1-distance_improvement) * 8.0  # 合理权重
+        else:
+            distance_reward = 0
+        
+        # 2. 步数惩罚（轻微）
+        step_penalty = -0.01
+        
+        # 3. 撞墙惩罚（适中）
+        wall_penalty = -0.8 if hit_wall else 0.0
+        
+        # 4. 重复访问惩罚（防止刷分，但要适度）
+        current_pos = tuple(self.human)
+        
+        # 确保访问计数器存在
+        if not hasattr(self, 'position_visit_count'):
+            self.position_visit_count = {}
+        
+        visit_count = self.position_visit_count.get(current_pos, 0) + 1
+        self.position_visit_count[current_pos] = visit_count
+        
+        # 重复访问惩罚（适度）
+        repeat_penalty = 0
+        if visit_count > 2:  # 第三次及以后访问才惩罚
+            repeat_penalty = -0.5 * (visit_count - 2)  # 轻微惩罚
+        
+        # 5. 探索奖励（鼓励访问新区域）
+        explore_reward = 2 if visit_count == 1 else 0.0
+        
+        # 6. 限制负奖励幅度
+        repeat_penalty = max(repeat_penalty, -8)
+        
+        # 7. 组合奖励
+        reward = distance_reward + step_penalty + wall_penalty + repeat_penalty + explore_reward
+        
+        # 8. 检查是否超时
+        truncated = self.step_count >= self.max_steps
+
+        observation = self.get_observation()
+
+        info = {
+            'position': tuple(self.human),
+            'goal': self.goalpos,
+            'old_position': tuple(old_pos),
+            'hit_wall': hit_wall,
+            'distance_to_goal': new_distance,
+            'distance_improvement': distance_improvement,
+            'total_reward': reward,
+            'step': self.step_count
+        }
+        
+        if self.render_mode == 'human':
+            self.render()
+            
+        return observation, reward, terminated, truncated, info
+
+    
+    def render(self):
+        try:
+            import pygame
+            from pygame import gfxdraw
+        except ImportError as e:
+            raise DependencyNotInstalled(
+                'pygame is not installed, run `pip install "gymnasium[box2d]"`'
+            ) from e
+        
+        if self.window is None and self.render_mode == "human":
+            pygame.init()
+            pygame.display.init()
+            self.window = pygame.display.set_mode((VIEWPORT_W, VIEWPORT_H))   
+        
+        if self.clock is None:
+            self.clock = pygame.time.Clock()
+        
+        surf = pygame.Surface((VIEWPORT_W, VIEWPORT_H))
+        surf.fill(self.color['background'])
+        
+        # 计算单元格大小
+        cell_width = VIEWPORT_W / self.col
+        cell_height = VIEWPORT_H / self.row
+        
+        # 绘制迷宫
+        for i in range(self.row):
+            for j in range(self.col):
+                x = j * cell_width
+                y = i * cell_height
+                
+                if (i, j) == tuple(self.startpos):
+                    color = self.color['start']
+                elif (i, j) == self.goalpos:
+                    color = self.color['goal']
+                elif self.maze[i][j] == 0:
+                    color = self.color['obstacle']
+                else:
+                    color = self.color['path']
+                
+                pygame.draw.rect(surf, color, (x, y, cell_width, cell_height))
+                
+                # 绘制局部视野范围
+                if abs(i - self.human[0]) <= self.view_range and abs(j - self.human[1]) <= self.view_range:
+                    pygame.draw.rect(surf, (255, 255, 200, 100), 
+                                   (x, y, cell_width, cell_height), 1)
+        
+        # 绘制智能体
+        human_x = self.human[1] * cell_width + cell_width // 2
+        human_y = self.human[0] * cell_height + cell_height // 2
+        pygame.draw.circle(surf, self.color['human'], 
+                          (int(human_x), int(human_y)), 
+                          min(cell_height, cell_width) // 3)
+        
+        # 绘制视野方向
+        # 可以在智能体周围绘制一个小箭头表示方向
+        
+        if self.render_mode == 'human':
+            self.window.blit(surf, (0, 0))
+            
+            # 添加状态信息显示
+            font = pygame.font.Font(None, 24)
+            info_text = f"Position: {self.human}  Goal: {self.goalpos}  Steps: {self.step_count}"
+            text_surface = font.render(info_text, True, (0, 0, 0))
+            self.window.blit(text_surface, (10, 10))
+            
+            self.clock.tick(self.metadata['render_fps'])
+            pygame.display.flip()
+            
+        elif self.render_mode == 'rgb_array':
+            rgb_array = pygame.surfarray.array3d(surf)
+            return np.transpose(rgb_array, (1, 0, 2))
+    
+    def close(self):
+        if self.window is not None:
+            pygame.display.quit()
+            pygame.quit()
+            self.window = None
+            self.clock = None
+
+# 优先使用CUDA
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"CUDA version: {torch.version.cuda}")
+
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim, view_range, hidden_dim=256):
+        super(Actor, self).__init__()
+        self.view_range = view_range
+        grid_size = view_range * 2 + 1
+        
+        # 两层卷积层提取局部迷宫特征
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=5, stride=1, padding=2)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
+        
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((6, 6))
+        # 计算卷积层输出大小
+        conv_output_size = 64 * 6 * 6
+        
+        # 两层全连接层
+        self.fc1 = nn.Linear(conv_output_size + 2, hidden_dim)  # +2 是坐标特征
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, action_dim)
+        
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.1)
+
+        # 初始化权重
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.orthogonal_(module.weight, gain=0.01)
+            nn.init.constant_(module.bias, 0.0)
+        elif isinstance(module, nn.Conv2d):
+            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+            nn.init.constant_(module.bias, 0.0)
+
+    def forward(self, x):
+        # x的形状: [batch_size, state_dim]
+        batch_size = x.size(0)
+        grid_size = self.view_range * 2 + 1
+        local_grid_size = grid_size * grid_size
+        
+        # 分离局部迷宫拓扑和坐标信息
+        local_maze_features = x[:, 2:2+local_grid_size]  # 局部迷宫特征
+        coord_features = x[:, :2]  # 相对坐标
+        
+        # 重塑局部迷宫特征为2D网格 (batch, 1, grid_size, grid_size)
+        local_maze_features = local_maze_features.view(batch_size, 1, grid_size, grid_size)
+        
+        # 卷积处理
+        x_conv = self.relu(self.conv1(local_maze_features))
+        x_conv = self.relu(self.conv2(x_conv))
+        
+        x_conv = self.adaptive_pool(x_conv)
+
+        # 展平卷积特征
+        x_conv_flat = x_conv.view(batch_size, -1)
+        
+        # 合并卷积特征和坐标特征
+        x_combined = torch.cat([x_conv_flat, coord_features], dim=1)
+        
+        # 全连接层
+        x_fc = self.relu(self.fc1(x_combined))
+        x_fc = self.dropout(x_fc)
+        x_fc = self.relu(self.fc2(x_fc))
+        
+        # 输出动作概率
+        return F.softmax(self.fc3(x_fc), dim=-1)
+
+class Critic(nn.Module):
+    def __init__(self, state_dim, view_range, hidden_dim=256):
+        super(Critic, self).__init__()
+        self.view_range = view_range
+        grid_size = view_range * 2 + 1
+        
+        # 两层卷积层提取局部迷宫特征
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=5, stride=1, padding=2)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((6, 6))
+        
+        # 计算卷积层输出大小
+        conv_output_size = 64 * 6 * 6
+        
+        # 两层全连接层
+        self.fc1 = nn.Linear(conv_output_size + 2, hidden_dim)  # +2 是坐标特征
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, 1)
+        
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.1)
+        
+        # 初始化权重
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.orthogonal_(module.weight, gain=1.0)
+            nn.init.constant_(module.bias, 0.0)
+        elif isinstance(module, nn.Conv2d):
+            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+            nn.init.constant_(module.bias, 0.0)
+
+    def forward(self, x):
+        # x的形状: [batch_size, state_dim]
+        batch_size = x.size(0)
+        grid_size = self.view_range * 2 + 1
+        local_grid_size = grid_size * grid_size
+        
+        # 分离局部迷宫拓扑和坐标信息
+        local_maze_features = x[:, 2:2+local_grid_size]  # 局部迷宫特征
+        coord_features = x[:, :2]  # 相对坐标
+        
+        # 重塑局部迷宫特征为2D网格 (batch, 1, grid_size, grid_size)
+        local_maze_features = local_maze_features.view(batch_size, 1, grid_size, grid_size)
+        
+        # 卷积处理
+        x_conv = self.relu(self.conv1(local_maze_features))
+        x_conv = self.relu(self.conv2(x_conv))
+        
+        x_conv = self.adaptive_pool(x_conv)
+
+        # 展平卷积特征
+        x_conv_flat = x_conv.view(batch_size, -1)
+        
+        # 合并卷积特征和坐标特征
+        x_combined = torch.cat([x_conv_flat, coord_features], dim=1)
+        
+        # 全连接层
+        x_fc = self.relu(self.fc1(x_combined))
+        x_fc = self.dropout(x_fc)
+        x_fc = self.relu(self.fc2(x_fc))
+        
+        # 输出状态价值
+        return self.fc3(x_fc)
+
+class ReplayMemory:
+    def __init__(self, batch_size, max_size=10000):
+        self.state_cap = []
+        self.action_cap = []
+        self.reward_cap = []
+        self.value_cap = []
+        self.done_cap = []
+        self.log_prob_cap = []
+        self.batch_size = batch_size
+        self.max_size = max_size
+
+    def add_memo(self, state, action, reward, value, done, log_prob):
+        self.state_cap.append(state)
+        self.action_cap.append(action)
+        self.reward_cap.append(reward)
+        self.value_cap.append(value)
+        self.done_cap.append(done)
+        self.log_prob_cap.append(log_prob)
+        
+        if len(self.state_cap) > self.max_size:
+            self.state_cap.pop(0)
+            self.action_cap.pop(0)
+            self.reward_cap.pop(0)
+            self.value_cap.pop(0)
+            self.done_cap.pop(0)
+            self.log_prob_cap.pop(0)
+
+    def get_all_data(self):
+        """获取所有数据用于PPO更新"""
+        return {
+            'states': np.array(self.state_cap, dtype=np.float32),
+            'actions': np.array(self.action_cap, dtype=np.int64),
+            'rewards': np.array(self.reward_cap, dtype=np.float32),
+            'values': np.array(self.value_cap, dtype=np.float32),
+            'dones': np.array(self.done_cap, dtype=np.bool_),
+            'log_probs': np.array(self.log_prob_cap, dtype=np.float32)
+        }
+
+    def clear_memo(self):
+        self.state_cap.clear()
+        self.action_cap.clear()
+        self.reward_cap.clear()
+        self.value_cap.clear()
+        self.done_cap.clear()
+        self.log_prob_cap.clear()
+
+class PPOAgent:
+    def __init__(self, state_dim, action_dim, view_range, batch_size=64, writer=None):
+        self.lr_actor = 3e-4
+        self.lr_critic = 3e-4
+        self.gamma = 0.99
+        self.lamb = 0.9  # GAE lambda
+        self.epoch = 10   # 优化epoch数
+        self.clip_range = 0.2  # PPO clip范围
+        self.batch_size = batch_size
+        self.entropy_coef = 0.01
+        self.view_range = view_range
+
+        # TensorBoard Writer
+        self.writer = writer
+        self.update_step = 0  # 用于记录更新次数
+
+        # 网络 - 直接创建在device上
+        self.actor = Actor(state_dim, action_dim, view_range).to(device)
+        self.critic = Critic(state_dim, view_range).to(device)
+        
+        # 优化器
+        self.actor_optim = optim.Adam(self.actor.parameters(), lr=self.lr_actor)
+        self.critic_optim = optim.Adam(self.critic.parameters(), lr=self.lr_critic)
+        
+        # 经验缓冲区
+        self.replay_buffer = ReplayMemory(batch_size)
+        
+        # 打印网络信息
+        self._print_network_info()
+
+    def _print_network_info(self):
+        """打印网络信息"""
+        print(f"\n网络架构信息:")
+        print(f"  Actor 参数量: {sum(p.numel() for p in self.actor.parameters()):,}")
+        print(f"  Critic 参数量: {sum(p.numel() for p in self.critic.parameters()):,}")
+        print(f"  设备: {device}")
+        if torch.cuda.is_available():
+            print(f"  显存占用: {torch.cuda.memory_allocated(0)/1024**2:.2f} MB")
+
+    def get_action(self, state):
+        """选择动作并返回动作、log概率和状态价值"""
+        # 确保state是numpy数组
+        if isinstance(state, list):
+            state = np.array(state, dtype=np.float32)
+        
+        # 创建张量并转移到device
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            action_probs = self.actor(state_tensor)
+            dist = torch.distributions.Categorical(action_probs)
+            action = dist.sample()
+            log_prob = dist.log_prob(action)
+            value = self.critic(state_tensor)
+        
+        return action.item(), log_prob.cpu().item(), value.cpu().item()
+
+    def compute_gae(self, rewards, values, dones):
+        """计算GAE优势函数和回报"""
+        T = len(rewards)
+        advantages = np.zeros(T, dtype=np.float32)
+        returns = np.zeros(T, dtype=np.float32)
+        
+        gae = 0
+        next_value = 0  # 最后一个时间步之后的价值为0
+        
+        for t in reversed(range(T)):
+            if t == T - 1:
+                next_value = 0 if dones[t] else values[t]
+            else:
+                next_value = values[t + 1] if not dones[t] else 0
+            
+            # TD误差
+            delta = rewards[t] + self.gamma * next_value - values[t]
+            
+            # GAE
+            gae = delta + self.gamma * self.lamb * (1 - dones[t]) * gae
+            advantages[t] = gae
+            
+            # 计算回报
+            returns[t] = advantages[t] + values[t]
+        
+        return advantages, returns
+
+    def compute_actor_critic_output(self, states, actions):
+        """计算策略和价值的输出"""
+        # 确保数据在GPU上
+        states_tensor = torch.FloatTensor(states).to(device)
+        actions_tensor = torch.LongTensor(actions).to(device)
+        
+        # 策略输出
+        action_probs = self.actor(states_tensor)
+        dist = torch.distributions.Categorical(action_probs)
+        log_probs = dist.log_prob(actions_tensor)
+        entropy = dist.entropy()
+        
+        # 价值输出
+        values = self.critic(states_tensor)
+        
+        return {
+            'log_probs': log_probs,
+            'entropy': entropy,
+            'values': values,
+            'dist': dist,
+            'action_probs': action_probs
+        }
+
+    def normalize_advantages(self, advantages):
+        """归一化优势函数"""
+        adv_mean = advantages.mean()
+        adv_std = advantages.std()
+        if adv_std < 1e-8:
+            return advantages - adv_mean
+        return (advantages - adv_mean) / (adv_std + 1e-8)
+
+    def update(self, episode):
+        # 1. 收集所有数据
+        data = self.replay_buffer.get_all_data()
+        n_samples = len(data['states'])
+        
+        if n_samples < self.batch_size:
+            return
+        
+        # 2. 计算GAE和回报
+        with torch.no_grad():
+            states_tensor = torch.FloatTensor(data['states']).to(device)
+            old_values = self.critic(states_tensor).squeeze().cpu().numpy()
+            
+            advantages, returns = self.compute_gae(
+                data['rewards'], 
+                old_values, 
+                data['dones']
+            )
+            
+            old_log_probs = torch.FloatTensor(data['log_probs']).to(device)
+        
+        # 转换为张量并转移到GPU
+        states_tensor = torch.FloatTensor(data['states']).to(device)
+        actions_tensor = torch.LongTensor(data['actions']).to(device)
+        returns_tensor = torch.FloatTensor(returns).to(device)
+        advantages_tensor = torch.FloatTensor(advantages).to(device)
+        
+        # 归一化优势函数
+        advantages_tensor = self.normalize_advantages(advantages_tensor)
+        
+        # 收集统计信息
+        epoch_policy_losses = []
+        epoch_critic_losses = []
+        epoch_entropies = []
+        epoch_ratios = []
+        all_ratios = []
+
+        # 3. 多轮优化
+        for epoch in range(self.epoch):
+            indices = np.random.permutation(n_samples)
+            n_batches = int(np.ceil(float(n_samples) / self.batch_size))
+            
+            for batch_idx in range(n_batches):
+                start_idx = batch_idx * self.batch_size
+                end_idx = start_idx + self.batch_size
+                batch_indices = indices[start_idx:end_idx]
+                
+                batch_states = states_tensor[batch_indices]
+                batch_actions = actions_tensor[batch_indices]
+                batch_old_log_probs = old_log_probs[batch_indices]
+                batch_advantages = advantages_tensor[batch_indices]
+                batch_returns = returns_tensor[batch_indices]
+                
+                # 4. 计算新策略的输出
+                actor_critic_output = self.compute_actor_critic_output(
+                    batch_states, 
+                    batch_actions
+                )
+                
+                new_log_probs = actor_critic_output['log_probs']
+                entropy = actor_critic_output['entropy'].mean()
+                values_pred = actor_critic_output['values'].squeeze()
+                
+                # 5. 计算概率比
+                ratio = torch.exp(new_log_probs - batch_old_log_probs)
+                all_ratios.append(ratio.detach())
+                
+                # ### 核心：PPO-Clip损失计算 ###
+                surr1 = ratio * batch_advantages
+                surr2 = torch.clamp(ratio, 
+                                    1.0 - self.clip_range, 
+                                    1.0 + self.clip_range) * batch_advantages
+                
+                # PPO-Clip策略损失
+                policy_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy
+                
+                # 6. 计算价值损失
+                critic_loss = F.mse_loss(values_pred.squeeze(), batch_returns.squeeze())
+                
+                # 7. 执行梯度步骤
+                # 更新Actor
+                self.actor_optim.zero_grad()
+                policy_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+                self.actor_optim.step()
+                
+                # 更新Critic
+                self.critic_optim.zero_grad()
+                critic_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+                self.critic_optim.step()
+                
+                # 收集统计信息
+                epoch_policy_losses.append(policy_loss.item())
+                epoch_critic_losses.append(critic_loss.item())
+                epoch_entropies.append(entropy.item())
+                epoch_ratios.append(ratio.mean().item())
+        
+        # 8. 清空缓冲区
+        self.replay_buffer.clear_memo()
+        
+        # 9. 记录训练统计
+        if len(epoch_policy_losses) > 0:
+            avg_policy_loss = np.mean(epoch_policy_losses)
+            avg_critic_loss = np.mean(epoch_critic_losses)
+            avg_entropy = np.mean(epoch_entropies)
+            avg_ratio = np.mean(epoch_ratios)
+            
+            # 计算clip_fraction
+            if len(all_ratios) > 0:
+                all_ratios_tensor = torch.cat(all_ratios)
+                clipped = torch.clamp(all_ratios_tensor, 
+                                    1.0 - self.clip_range, 
+                                    1.0 + self.clip_range)
+                clip_fraction = torch.mean(
+                    torch.abs(all_ratios_tensor - clipped) / (torch.abs(all_ratios_tensor) + 1e-8)
+                ).item()
+            else:
+                clip_fraction = 0.0
+            
+            # 打印训练统计
+            if self.update_step % 10 == 0:
+                print(f"\nUpdate {self.update_step}:")
+                print(f"  Policy Loss: {avg_policy_loss:.4f}")
+                print(f"  Value Loss: {avg_critic_loss:.4f}")
+                print(f"  Entropy: {avg_entropy:.4f}")
+                print(f"  Clip Fraction: {clip_fraction:.3f}")
+            
+            # TensorBoard记录
+            if self.writer is not None:
+                self.writer.add_scalar('Loss/Policy_Loss', avg_policy_loss, episode)
+                self.writer.add_scalar('Loss/Value_Loss', avg_critic_loss, episode)
+                self.writer.add_scalar('Policy/Entropy', avg_entropy, episode)
+                self.writer.add_scalar('Policy/Clip_Fraction', clip_fraction, episode)
+                self.writer.add_scalar('Policy/Probability_Ratio', avg_ratio, episode)
+                self.writer.add_scalar('Policy/Ratio_Std', np.std(epoch_ratios), episode)
+                
+                # 记录网络梯度
+                total_actor_grad_norm = 0
+                total_critic_grad_norm = 0
+                for param in self.actor.parameters():
+                    if param.grad is not None:
+                        total_actor_grad_norm += param.grad.norm().item()
+                for param in self.critic.parameters():
+                    if param.grad is not None:
+                        total_critic_grad_norm += param.grad.norm().item()
+                
+                self.writer.add_scalar('Gradients/Actor_Grad_Norm', total_actor_grad_norm, episode)
+                self.writer.add_scalar('Gradients/Critic_Grad_Norm', total_critic_grad_norm, episode)
+                
+                # 记录网络参数
+                for name, param in self.actor.named_parameters():
+                    self.writer.add_histogram(f'Actor/{name}', param, episode)
+                    if param.grad is not None:
+                        self.writer.add_histogram(f'Actor/{name}_grad', param.grad, episode)
+                
+                for name, param in self.critic.named_parameters():
+                    self.writer.add_histogram(f'Critic/{name}', param, episode)
+                    if param.grad is not None:
+                        self.writer.add_histogram(f'Critic/{name}_grad', param.grad, episode)
+
+                # 添加梯度信息
+                actor_grad_norm = 0
+                critic_grad_norm = 0
+                for p in self.actor.parameters():
+                    if p.grad is not None:
+                        actor_grad_norm += p.grad.data.norm(2).item() ** 2
+                for p in self.critic.parameters():
+                    if p.grad is not None:
+                        critic_grad_norm += p.grad.data.norm(2).item() ** 2
+                
+                actor_grad_norm = actor_grad_norm ** 0.5
+                critic_grad_norm = critic_grad_norm ** 0.5
+                
+                self.writer.add_scalar('Grad/Actor_Norm', actor_grad_norm, episode)
+                self.writer.add_scalar('Grad/Critic_Norm', critic_grad_norm, episode)
+            
+            self.update_step += 1
+        
+        return {
+            'policy_loss': avg_policy_loss,
+            'critic_loss': avg_critic_loss,
+            'entropy': avg_entropy,
+            'clip_fraction': clip_fraction
+        }
+        
+    
+    def save_policy(self, path="ppo_model_final.pth"):
+        """保存模型"""
+        torch.save({
+            'actor_state_dict': self.actor.state_dict(),
+            'critic_state_dict': self.critic.state_dict(),
+            'actor_optim_state_dict': self.actor_optim.state_dict(),
+            'critic_optim_state_dict': self.critic_optim.state_dict(),
+            'view_range': self.view_range,
+        }, path)
+        print(f"模型保存到: {path}")
+    
+    def load_policy(self, path="ppo_model_final.pth"):
+        """加载模型"""
+        checkpoint = torch.load(path, map_location=device)
+        self.actor.load_state_dict(checkpoint['actor_state_dict'])
+        self.critic.load_state_dict(checkpoint['critic_state_dict'])
+        self.actor_optim.load_state_dict(checkpoint['actor_optim_state_dict'])
+        self.critic_optim.load_state_dict(checkpoint['critic_optim_state_dict'])
+        print(f"模型加载自: {path}")
+
+def train_maze(env, episodes=2000, max_steps=100, batch_size=128, update_interval=20):
+    """训练PPO智能体解决迷宫，添加TensorBoard监控"""
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.n
+    view_range = env.view_range
+    
+    print(f"状态维度: {state_dim}")
+    print(f"动作维度: {action_dim}")
+    print(f"视野范围: {view_range}")
+    
+    # 创建TensorBoard Writer
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    writer = SummaryWriter(f'runs/maze_ppo_{timestamp}')
+    
+    # 将writer传递给PPOAgent
+    agent = PPOAgent(state_dim, action_dim, view_range, batch_size, writer=writer)
+    
+    episode_rewards = []
+    successes = []
+    episode_lengths = []
+    
+    print("\n开始训练...")
+    print("=" * 50)
+    
+    # 设置CUDA优化
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.enabled = True
+    
+    for episode in range(1, episodes + 1):
+        state, info = env.reset()
+        episode_reward = 0
+        episode_length = 0
+        done = False
+        
+        while not done and episode_length < max_steps:
+            action, log_prob, value = agent.get_action(state)
+            next_state, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+            
+            agent.replay_buffer.add_memo(
+                state, action, reward, value, done, log_prob
+            )
+            
+            state = next_state
+            episode_reward += reward
+            episode_length += 1
+        
+        episode_rewards.append(episode_reward)
+        episode_lengths.append(episode_length)
+        successes.append(1 if terminated else 0)
+        
+        # 记录每个episode的统计信息到TensorBoard
+        if writer is not None:
+            writer.add_scalar('Episode/Reward', episode_reward, episode)
+            writer.add_scalar('Episode/Length', episode_length, episode)
+            writer.add_scalar('Episode/Success', 1 if terminated else 0, episode)
+            writer.add_scalar('Episode/Distance_To_Goal', 
+                             info.get('distance_to_goal', 0) if 'distance_to_goal' in info else 0, 
+                             episode)
+        
+        # 定期更新（收集足够数据后）
+        if episode % update_interval == 0 and len(agent.replay_buffer.state_cap) >= batch_size:
+            update_stats = agent.update(episode)
+        
+        if episode % 50 == 0:
+            avg_reward = np.mean(episode_rewards[-50:]) if len(episode_rewards) >= 50 else episode_reward
+            success_rate = np.mean(successes[-50:]) * 100 if len(successes) >= 50 else 0
+            avg_length = np.mean(episode_lengths[-50:]) if len(episode_lengths) >= 50 else episode_length
+            
+            # 记录滑动平均统计到TensorBoard
+            if writer is not None:
+                writer.add_scalar('Episode/Avg_Reward_50', avg_reward, episode)
+                writer.add_scalar('Episode/Avg_Length_50', avg_length, episode)
+                writer.add_scalar('Episode/Success_Rate_50', success_rate, episode)
+            
+            print(f"Episode {episode:4d} | "
+                  f"Reward: {episode_reward:7.2f} | "
+                  f"Avg Reward (50): {avg_reward:7.2f} | "
+                  f"Length: {episode_length:3d} | "
+                  f"Avg Length (50): {avg_length:5.1f} | "
+                  f"Success: {('Yes' if terminated else 'No'):3s} | "
+                  f"Success Rate: {success_rate:5.1f}%")
+    
+    # 关闭writer
+    writer.close()
+    
+    print("\n" + "=" * 50)
+    print(f"训练完成!")
+    print(f"最终成功率: {np.mean(successes[-50:])*100:.1f}%" if len(successes) >= 50 else "训练数据不足")
+    
+    # 保存最终模型
+    agent.save_policy("ppo_maze_model_final.pth")
+    
+    # 清理GPU缓存
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    return agent
+
+def test_maze(env, agent, episodes=10, render=True):
+    """测试训练好的智能体"""
+    total_rewards = []
+    total_lengths = []
+    successes = []
+    
+    print("\n开始测试...")
+    print("=" * 50)
+    
+    for episode in range(1, episodes + 1):
+        state, info = env.reset()
+        episode_reward = 0
+        episode_length = 0
+        done = False
+        
+        while not done and episode_length < 500:
+            if render:
+                env.render()
+                time.sleep(0.05)
+
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        env.close()
+                        return total_rewards, successes
+            
+            # 测试时使用贪婪策略
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+            with torch.no_grad():
+                action_probs = agent.actor(state_tensor)
+                action = torch.argmax(action_probs, dim=-1).item()
+            
+            next_state, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+            
+            state = next_state
+            episode_reward += reward
+            episode_length += 1
+        
+        total_rewards.append(episode_reward)
+        total_lengths.append(episode_length)
+        successes.append(1 if terminated else 0)
+        
+        print(f"Test Episode {episode:2d} | "
+              f"Reward: {episode_reward:7.2f} | "
+              f"Length: {episode_length:3d} | "
+              f"Success: {('Yes' if terminated else 'No'):3s}")
+    
+    print("\n" + "=" * 50)
+    print(f"测试完成!")
+    print(f"平均奖励: {np.mean(total_rewards):.2f} ± {np.std(total_rewards):.2f}")
+    print(f"平均步数: {np.mean(total_lengths):.1f} ± {np.std(total_lengths):.1f}")
+    print(f"成功率: {np.mean(successes)*100:.1f}%")
+    env.close()
+    return total_rewards, successes
+
+# ========== 主程序入口 ==========
+if __name__ == "__main__":
+    
+    # 参数设置
+    MAZE_SIZE = (11, 11)
+    VIEW_RANGE = 5
+    EPISODES = 1000
+    BATCH_SIZE = 256
+    MAX_STEPS = 200
+    
+    print("=" * 50)
+    print(f"迷宫环境: {MAZE_SIZE[0]}x{MAZE_SIZE[1]}")
+    print(f"视野范围: {VIEW_RANGE}")
+    print(f"总回合数: {EPISODES}")
+    print(f"批次大小: {BATCH_SIZE}")
+    print(f"使用设备: {device}")
+    print("=" * 50)
+    
+    # 创建训练环境
+    train_env = mazeEnv(mazesize=MAZE_SIZE, render_mode=None, view_range=VIEW_RANGE)
+    
+    # 训练智能体
+    agent = train_maze(
+        env=train_env,
+        episodes=EPISODES,
+        max_steps=MAX_STEPS,
+        batch_size=BATCH_SIZE,
+        update_interval=10
+    )
+    
     # 测试智能体
     test_env = mazeEnv(mazesize=MAZE_SIZE, render_mode='human', view_range=VIEW_RANGE)
     test_maze(test_env, agent, episodes=10, render=True)
