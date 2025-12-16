@@ -1493,8 +1493,15 @@ class PPOAgent:
     def compute_actor_critic_output(self, states, actions):
         """计算策略和价值的输出"""
         # 确保数据在GPU上
-        states_tensor = torch.FloatTensor(states).to(device)
-        actions_tensor = torch.LongTensor(actions).to(device)
+        if not isinstance(states, torch.Tensor):
+            states_tensor = torch.as_tensor(states, dtype=torch.float32).to(device)
+        else:
+            states_tensor = states.to(device) if states.device != device else states
+        
+        if not isinstance(actions, torch.Tensor):
+            actions_tensor = torch.as_tensor(actions, dtype=torch.long).to(device)
+        else:
+            actions_tensor = actions.to(device) if actions.device != device else actions
         
         # 策略输出
         action_probs = self.actor(states_tensor)
@@ -1889,7 +1896,7 @@ if __name__ == "__main__":
     # 参数设置
     MAZE_SIZE = (11, 11)
     VIEW_RANGE = 5
-    EPISODES = 1000
+    EPISODES = 3000
     BATCH_SIZE = 256
     MAX_STEPS = 200
     
