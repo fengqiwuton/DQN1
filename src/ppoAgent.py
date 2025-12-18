@@ -1,4 +1,409 @@
 '''import gymnasium as gym
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import numpy as np
+from torch.distributions import Categorical
+import matplotlib.pyplot as plt
+import os
+
+# 设置设备
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+class ActorCritic(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=256):
+        super(ActorCritic, self).__init__()
+        
+        # 共享特征提取层
+        self.shared = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+        )
+        
+        # Actor网络（策略网络）
+        self.actor = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, action_dim),
+        )
+        
+        # Critic网络（价值网络）
+        self.critic = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1),
+        )
+        
+    def forward(self, state):
+        features = self.shared(state)
+        action_probs = F.softmax(self.actor(features), dim=-1)
+        state_value = self.critic(features)
+        return action_probs, state_value
+
+class PPOAgent:
+    def __init__(self, state_dim, action_dim, lr=3e-4, gamma=0.99, 
+                 epsilon=0.2, epochs=10, batch_size=64, gae_lambda=0.95):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.gae_lambda = gae_lambda
+        
+        # 初始化网络
+        self.policy = ActorCritic(state_dim, action_dim).to(device)
+        self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
+        
+        # 存储轨迹
+        self.states = []
+        self.actions = []
+        self.log_probs = []
+        self.rewards = []
+        self.values = []
+        self.dones = []
+        
+    def act(self, state):
+        """选择动作并返回相关信息"""
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            action_probs, state_value = self.policy(state_tensor)
+        
+        dist = Categorical(action_probs)
+        action = dist.sample()
+        
+        return action.item(), dist.log_prob(action), state_value
+    
+    def store_transition(self, state, action, log_prob, value, reward, done):
+        """存储单步转移"""
+        self.states.append(state)
+        self.actions.append(action)
+        self.log_probs.append(log_prob)
+        self.values.append(value)
+        self.rewards.append(reward)
+        self.dones.append(done)
+        
+    def compute_returns(self):
+        """计算GAE和优势函数"""
+        returns = []
+        advantages = []
+        
+        # 转换为numpy数组以便计算
+        rewards = np.array(self.rewards)
+        values = np.array([v.item() for v in self.values])
+        dones = np.array(self.dones)
+        
+        # 计算TD目标值
+        next_values = np.append(values[1:], 0)  # 最后一个状态的下一个状态价值为0
+        deltas = rewards + self.gamma * next_values * (1 - dones) - values
+        
+        # 计算GAE优势
+        advantages = np.zeros_like(deltas)
+        advantage = 0
+        for t in reversed(range(len(deltas))):
+            advantage = deltas[t] + self.gamma * self.gae_lambda * (1 - dones[t]) * advantage
+            advantages[t] = advantage
+        
+        # 计算returns
+        returns = advantages + values
+        
+        # 转换为tensor并标准化优势函数
+        returns = torch.FloatTensor(returns).to(device)
+        advantages = torch.FloatTensor(advantages).to(device)
+        
+        # 标准化优势函数（添加小常数防止除零）
+        if len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        return returns, advantages
+    
+    def update(self):
+        """执行PPO更新"""
+        if len(self.states) < self.batch_size:
+            return
+        
+        # 将数据转换为tensor
+        old_states = torch.FloatTensor(np.array(self.states)).to(device)
+        old_actions = torch.LongTensor(self.actions).to(device)
+        old_log_probs = torch.stack(self.log_probs).to(device)
+        
+        # 计算returns和advantages
+        returns, advantages = self.compute_returns()
+        
+        # 多轮更新
+        total_policy_loss = 0
+        total_value_loss = 0
+        
+        for _ in range(self.epochs):
+            # 随机打乱数据
+            indices = torch.randperm(len(old_states))
+            
+            # 小批量训练
+            for start in range(0, len(indices), self.batch_size):
+                end = start + self.batch_size
+                batch_indices = indices[start:end]
+                
+                # 获取当前批次数据
+                batch_states = old_states[batch_indices]
+                batch_actions = old_actions[batch_indices]
+                batch_old_log_probs = old_log_probs[batch_indices]
+                batch_returns = returns[batch_indices]
+                batch_advantages = advantages[batch_indices]
+                
+                # 前向传播
+                action_probs, values = self.policy(batch_states)
+                dist = Categorical(action_probs)
+                
+                # 计算新策略的对数概率
+                new_log_probs = dist.log_prob(batch_actions)
+                
+                # 计算策略比率
+                ratios = torch.exp(new_log_probs - batch_old_log_probs)
+                
+                # 计算PPO损失的两个部分
+                surr1 = ratios * batch_advantages
+                surr2 = torch.clamp(ratios, 1 - self.epsilon, 1 + self.epsilon) * batch_advantages
+                
+                # 策略损失（负号因为要最大化）
+                policy_loss = -torch.min(surr1, surr2).mean()
+                
+                # 修正值损失计算：确保形状匹配
+                # values的形状是 [batch_size, 1]，batch_returns的形状是 [batch_size]
+                # 我们需要将values的形状调整为 [batch_size]
+                values = values.squeeze()
+                
+                # 确保两个张量形状一致
+                if values.dim() == 0:  # 如果是标量
+                    values = values.unsqueeze(0)
+                
+                value_loss = F.mse_loss(values, batch_returns)
+                
+                # 总损失（可以添加熵正则化项鼓励探索）
+                entropy = dist.entropy().mean()
+                loss = policy_loss + 0.5 * value_loss - 0.01 * entropy
+                
+                # 反向传播和优化
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+                self.optimizer.step()
+                
+                total_policy_loss += policy_loss.item()
+                total_value_loss += value_loss.item()
+        
+        # 清空缓冲区
+        self.clear_buffer()
+        
+        return total_policy_loss / self.epochs, total_value_loss / self.epochs
+        
+    def clear_buffer(self):
+        """清空经验缓冲区"""
+        self.states = []
+        self.actions = []
+        self.log_probs = []
+        self.rewards = []
+        self.values = []
+        self.dones = []
+
+class PPOTrainer:
+    def __init__(self, env_name="LunarLander-v2", max_steps=1000):
+        self.env = gym.make(env_name)
+        self.max_steps = max_steps
+        
+        # 获取状态和动作空间维度
+        state_dim = self.env.observation_space.shape[0]
+        action_dim = self.env.action_space.n
+        
+        print(f"State dimension: {state_dim}")
+        print(f"Action dimension: {action_dim}")
+        
+        # 初始化PPO智能体
+        self.agent = PPOAgent(state_dim, action_dim)
+        
+        # 训练统计
+        self.rewards_history = []
+        self.policy_losses = []
+        self.value_losses = []
+        
+    def train_episode(self, episode_num):
+        """训练一个回合"""
+        state, _ = self.env.reset()
+        episode_reward = 0
+        done = False
+        truncated = False
+        
+        for step in range(self.max_steps):
+            # 选择动作
+            action, log_prob, value = self.agent.act(state)
+            
+            # 执行动作
+            next_state, reward, done, truncated, _ = self.env.step(action)
+            
+            # 存储转移
+            self.agent.store_transition(state, action, log_prob, value.item(), reward, done or truncated)
+            
+            # 更新状态
+            state = next_state
+            episode_reward += reward
+            
+            # 如果回合结束
+            if done or truncated:
+                break
+        
+        # 更新策略并获取损失值
+        policy_loss, value_loss = self.agent.update()
+        self.policy_losses.append(policy_loss)
+        self.value_losses.append(value_loss)
+        
+        # 记录统计信息
+        self.rewards_history.append(episode_reward)
+        
+        # 打印进度
+        if episode_num % 10 == 0:
+            avg_reward = np.mean(self.rewards_history[-10:])
+            print(f"Episode {episode_num}, Reward: {episode_reward:.2f}, Avg Reward (last 10): {avg_reward:.2f}, "
+                  f"Policy Loss: {policy_loss:.4f}, Value Loss: {value_loss:.4f}")
+            
+        return episode_reward
+    
+    def train(self, total_episodes=1000, save_interval=100):
+        """主训练循环"""
+        print("Starting training...")
+        
+        for episode in range(1, total_episodes + 1):
+            reward = self.train_episode(episode)
+            
+            # 定期保存模型
+            if episode % save_interval == 0:
+                self.save_model(f"ppo_lunar_lander_episode_{episode}.pth")
+                
+        print("Training completed!")
+        
+        # 绘制训练曲线
+        self.plot_training_progress()
+        
+    def evaluate(self, model_path=None, num_episodes=10, render=True):
+        """评估训练好的模型"""
+        if model_path:
+            self.load_model(model_path)
+            
+        print("Evaluating agent...")
+        
+        total_rewards = []
+        
+        for episode in range(num_episodes):
+            state, _ = self.env.reset()
+            episode_reward = 0
+            done = False
+            truncated = False
+            
+            while not (done or truncated):
+                if render:
+                    self.env.render()
+                    
+                # 使用确定性策略
+                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    action_probs, _ = self.agent.policy(state_tensor)
+                
+                action = torch.argmax(action_probs).item()
+                
+                state, reward, done, truncated, _ = self.env.step(action)
+                episode_reward += reward
+            
+            total_rewards.append(episode_reward)
+            print(f"Evaluation Episode {episode + 1}, Reward: {episode_reward:.2f}")
+        
+        avg_reward = np.mean(total_rewards)
+        print(f"Average Reward over {num_episodes} episodes: {avg_reward:.2f}")
+        
+        if render:
+            self.env.close()
+            
+        return avg_reward
+    
+    def save_model(self, filename):
+        """保存模型"""
+        torch.save({
+            'policy_state_dict': self.agent.policy.state_dict(),
+            'optimizer_state_dict': self.agent.optimizer.state_dict(),
+            'rewards_history': self.rewards_history,
+            'policy_losses': self.policy_losses,
+            'value_losses': self.value_losses,
+        }, filename)
+        print(f"Model saved to {filename}")
+        
+    def load_model(self, filename):
+        """加载模型"""
+        checkpoint = torch.load(filename, map_location=device)
+        self.agent.policy.load_state_dict(checkpoint['policy_state_dict'])
+        self.agent.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.rewards_history = checkpoint['rewards_history']
+        self.policy_losses = checkpoint.get('policy_losses', [])
+        self.value_losses = checkpoint.get('value_losses', [])
+        print(f"Model loaded from {filename}")
+        
+    def plot_training_progress(self):
+        """绘制训练进度图"""
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        
+        # 绘制奖励曲线
+        axes[0, 0].plot(self.rewards_history)
+        axes[0, 0].set_xlabel('Episode')
+        axes[0, 0].set_ylabel('Reward')
+        axes[0, 0].set_title('Training Rewards')
+        axes[0, 0].grid(True)
+        
+        # 绘制滑动平均奖励
+        axes[0, 1].plot(self.rewards_history, alpha=0.3, label='Raw')
+        window_size = 50
+        if len(self.rewards_history) >= window_size:
+            moving_avg = np.convolve(self.rewards_history, np.ones(window_size)/window_size, mode='valid')
+            axes[0, 1].plot(range(window_size-1, len(self.rewards_history)), moving_avg, 
+                           linewidth=2, label=f'MA({window_size})')
+        axes[0, 1].set_xlabel('Episode')
+        axes[0, 1].set_ylabel('Average Reward')
+        axes[0, 1].set_title(f'Moving Average Reward')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True)
+        
+        # 绘制策略损失
+        if self.policy_losses:
+            axes[1, 0].plot(self.policy_losses)
+            axes[1, 0].set_xlabel('Episode')
+            axes[1, 0].set_ylabel('Policy Loss')
+            axes[1, 0].set_title('Policy Loss')
+            axes[1, 0].grid(True)
+        
+        # 绘制价值损失
+        if self.value_losses:
+            axes[1, 1].plot(self.value_losses)
+            axes[1, 1].set_xlabel('Episode')
+            axes[1, 1].set_ylabel('Value Loss')
+            axes[1, 1].set_title('Value Loss')
+            axes[1, 1].grid(True)
+        
+        plt.tight_layout()
+        plt.savefig('training_progress.png', dpi=150)
+        plt.show()
+
+# 示例使用
+if __name__ == "__main__":
+    # 创建训练器
+    trainer = PPOTrainer(env_name="LunarLander-v3", max_steps=1000)
+    
+    # 开始训练
+    trainer.train(total_episodes=500, save_interval=100)
+    
+    # 评估最佳模型
+    print("\nEvaluating the best model...")
+    trainer.evaluate(num_episodes=5, render=True)'''
+'''import gymnasium as gym
 import numpy as np
 from collections import defaultdict
 from gymnasium import spaces
@@ -867,6 +1272,9 @@ if __name__ == "__main__":
     # 测试智能体
     test_env = mazeEnv(mazesize=MAZE_SIZE, render_mode='human', view_range=VIEW_RANGE)
     test_maze(test_env, agent, episodes=10, render=True)'''
+
+# use convolution
+
 import gymnasium as gym
 import numpy as np
 from collections import defaultdict
